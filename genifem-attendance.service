@@ -1,0 +1,16 @@
+[Unit]
+Description=Genifem Attendance Slack Webhook Service
+After=network.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/genifem-attendance
+EnvironmentFile=/home/ubuntu/genifem-attendance/.env
+ExecStart=/home/ubuntu/genifem-attendance/venv/bin/uvicorn main:app --host 0.0.0.0 --port 8001
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
