@@ -47,14 +47,21 @@ class TestCheckin:
         mock_dt.now.return_value = datetime(2026, 4, 2, 10, 0, tzinfo=KARACHI)
         mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
         resolver, sheets = _make_mocks()
-        sheets.find_row.return_value = {
-            "row_number": 5,
-            "name": "John Doe",
-            "date": "2026-04-02",
-            "checkin": "9:00 AM",
-            "checkout": "",
-            "duration": "",
-        }
+
+        # Only return a row for today (not for past dates)
+        def find_row_side_effect(name, date):
+            if date == "2026-04-02":
+                return {
+                    "row_number": 5,
+                    "name": "John Doe",
+                    "date": "2026-04-02",
+                    "checkin": "9:00 AM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
 
         process_attendance(
             _make_event("Check in 10:47 am"), resolver, sheets
@@ -83,7 +90,7 @@ class TestCheckout:
             _make_event("Checkout 11:00 PM"), resolver, sheets
         )
 
-        sheets.update_row.assert_called_once_with(5, "11:00 PM", "2h 50m")
+        sheets.update_row.assert_called_once_with("John Doe", 5, "11:00 PM", "2h 50m")
 
     @patch("engine.datetime")
     def test_overnight_checkout_finds_yesterday(self, mock_dt):
@@ -110,7 +117,7 @@ class TestCheckout:
             _make_event("Checkout 2:00 am"), resolver, sheets
         )
 
-        sheets.update_row.assert_called_once_with(10, "2:00 am", "4h 0m")
+        sheets.update_row.assert_called_once_with("John Doe", 10, "2:00 am", "4h 0m")
 
     @patch("engine.datetime")
     def test_checkout_no_row_creates_na(self, mock_dt):
@@ -164,7 +171,97 @@ class TestJibble:
         process_attendance(event, resolver, sheets)
 
         resolver.resolve_jibble_name.assert_called_once_with("Haseeb")
-        sheets.update_row.assert_called_once_with(7, "6:00 PM", "8h 0m")
+        sheets.update_row.assert_called_once_with("Abdul Haseeb", 7, "6:00 PM", "8h 0m")
+
+
+class TestMissedCheckout:
+    @patch("engine.datetime")
+    def test_checkin_auto_closes_missed_checkout(self, mock_dt):
+        """Check-in on day 2 should mark day 1's empty checkout as 'Missed'."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 9, 30, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-01":
+                return {
+                    "row_number": 5,
+                    "date": "2026-04-01",
+                    "checkin": "9:00 AM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Check in 9:30 am"), resolver, sheets
+        )
+
+        # Should auto-close yesterday's row
+        sheets.update_row.assert_called_once_with("John Doe", 5, "Missed", "Missed")
+        # Should still create today's row
+        sheets.append_row.assert_called_once_with(
+            "John Doe", "2026-04-02", "9:30 am", "", ""
+        )
+
+    @patch("engine.datetime")
+    def test_checkin_skips_already_closed_yesterday(self, mock_dt):
+        """If yesterday's row has a checkout, don't mark it as missed."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 9, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-01":
+                return {
+                    "row_number": 5,
+                    "date": "2026-04-01",
+                    "checkin": "9:00 AM",
+                    "checkout": "5:00 PM",
+                    "duration": "8h 0m",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Check in 9:00 am"), resolver, sheets
+        )
+
+        # Should NOT auto-close (yesterday already closed)
+        sheets.update_row.assert_not_called()
+        sheets.append_row.assert_called_once()
+
+    @patch("engine.datetime")
+    def test_checkout_finds_multi_day_old_row(self, mock_dt):
+        """Checkout should find unclosed rows up to 7 days back (e.g. Friday→Monday)."""
+        # It's Monday Apr 6, unclosed row from Friday Apr 3
+        mock_dt.now.return_value = datetime(2026, 4, 6, 9, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-03":
+                return {
+                    "row_number": 8,
+                    "date": "2026-04-03",
+                    "checkin": "10:00 PM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Checkout 6:00 am"), resolver, sheets
+        )
+
+        sheets.update_row.assert_called_once_with(
+            "John Doe", 8, "6:00 am", "8h 0m"
+        )
 
 
 class TestSkip:

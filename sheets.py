@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 MAX_RETRIES = 3
 
+HEADER_ROW = ["Date", "Check-In", "Check-Out", "Duration"]
+
 
 def _retry_on_rate_limit(func):
     """Decorator that retries gspread calls on 429 rate limit errors."""
@@ -42,38 +44,51 @@ def _load_credentials(service_account_json: str) -> Credentials:
 class GoogleSheetsClient:
     """Client for reading/writing attendance data to Google Sheets.
 
-    Expected columns: A=Name, B=Date, C=Check-In, D=Check-Out, E=Duration
+    Each person gets their own worksheet tab named after them.
+    Columns: A=Date, B=Check-In, C=Check-Out, D=Duration
     """
 
     def __init__(self, service_account_json: str, sheet_id: str):
         creds = _load_credentials(service_account_json)
         self.gc = gspread.authorize(creds)
-        self.sheet = self.gc.open_by_key(sheet_id).sheet1
+        self.spreadsheet = self.gc.open_by_key(sheet_id)
+
+    def _get_or_create_worksheet(self, name: str) -> gspread.Worksheet:
+        """Get the worksheet for a person, creating it if it doesn't exist."""
+        try:
+            return self.spreadsheet.worksheet(name)
+        except gspread.exceptions.WorksheetNotFound:
+            logger.info("Creating new worksheet for '%s'", name)
+            ws = self.spreadsheet.add_worksheet(title=name, rows=100, cols=4)
+            ws.append_row(HEADER_ROW, value_input_option="USER_ENTERED")
+            return ws
 
     @_retry_on_rate_limit
     def find_row(self, name: str, date: str) -> dict | None:
-        """Search for a row matching (name, date).
+        """Search for a row matching date in the person's worksheet.
 
-        Returns dict with row_number, name, date, checkin, checkout, duration
+        Returns dict with row_number, date, checkin, checkout, duration
         or None if not found.
         """
+        ws = self._get_or_create_worksheet(name)
         try:
-            cells = self.sheet.findall(name, in_column=1)
+            cells = ws.findall(date, in_column=1)
         except gspread.exceptions.APIError:
-            logger.exception("Error searching for name=%s", name)
+            logger.exception("Error searching for date=%s in sheet '%s'", date, name)
             return None
 
         for cell in cells:
-            row_values = self.sheet.row_values(cell.row)
-            # Ensure row has at least 2 columns (Name, Date)
-            if len(row_values) >= 2 and row_values[1] == date:
+            # Skip header row
+            if cell.row == 1:
+                continue
+            row_values = ws.row_values(cell.row)
+            if len(row_values) >= 1 and row_values[0] == date:
                 return {
                     "row_number": cell.row,
-                    "name": row_values[0] if len(row_values) > 0 else "",
-                    "date": row_values[1] if len(row_values) > 1 else "",
-                    "checkin": row_values[2] if len(row_values) > 2 else "",
-                    "checkout": row_values[3] if len(row_values) > 3 else "",
-                    "duration": row_values[4] if len(row_values) > 4 else "",
+                    "date": row_values[0] if len(row_values) > 0 else "",
+                    "checkin": row_values[1] if len(row_values) > 1 else "",
+                    "checkout": row_values[2] if len(row_values) > 2 else "",
+                    "duration": row_values[3] if len(row_values) > 3 else "",
                 }
         return None
 
@@ -81,18 +96,20 @@ class GoogleSheetsClient:
     def append_row(
         self, name: str, date: str, checkin: str, checkout: str, duration: str
     ) -> None:
-        """Append a new attendance row at the bottom of the sheet."""
-        self.sheet.append_row(
-            [name, date, checkin, checkout, duration],
+        """Append a new attendance row to the person's worksheet."""
+        ws = self._get_or_create_worksheet(name)
+        ws.append_row(
+            [date, checkin, checkout, duration],
             value_input_option="USER_ENTERED",
         )
-        logger.info("Appended row: %s | %s | %s | %s | %s",
+        logger.info("Appended row to '%s': %s | %s | %s | %s",
                      name, date, checkin, checkout, duration)
 
     @_retry_on_rate_limit
-    def update_row(self, row_number: int, checkout: str, duration: str) -> None:
-        """Update Check-Out (col D) and Duration (col E) for an existing row."""
-        self.sheet.update_cell(row_number, 4, checkout)
-        self.sheet.update_cell(row_number, 5, duration)
-        logger.info("Updated row %d: checkout=%s, duration=%s",
-                     row_number, checkout, duration)
+    def update_row(self, name: str, row_number: int, checkout: str, duration: str) -> None:
+        """Update Check-Out (col C) and Duration (col D) in the person's worksheet."""
+        ws = self._get_or_create_worksheet(name)
+        ws.update_cell(row_number, 3, checkout)
+        ws.update_cell(row_number, 4, duration)
+        logger.info("Updated row %d in '%s': checkout=%s, duration=%s",
+                     row_number, name, checkout, duration)
