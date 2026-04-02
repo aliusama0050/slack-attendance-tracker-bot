@@ -59,10 +59,18 @@ def process_attendance(
     # 4. Determine dates
     now = datetime.now(KARACHI)
     today = now.strftime("%Y-%m-%d")
-    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
 
     # 5. Decision logic
     if result.action == "checkin":
+        # Auto-close any recent unclosed shift (up to 7 days back)
+        for days_ago in range(1, 8):
+            past_date = (now - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+            past_row = sheets.find_row(name, past_date)
+            if past_row and not past_row["checkout"]:
+                sheets.update_row(name, past_row["row_number"], "Missed", "Missed")
+                logger.warning("Auto-closed missed checkout for %s on %s", name, past_date)
+                break
+
         existing = sheets.find_row(name, today)
         if existing:
             logger.info("Duplicate check-in for %s on %s, ignoring", name, today)
@@ -75,19 +83,21 @@ def process_attendance(
         today_row = sheets.find_row(name, today)
         if today_row:
             duration = calculate_duration(today_row["checkin"], time_str)
-            sheets.update_row(today_row["row_number"], time_str, duration)
+            sheets.update_row(name, today_row["row_number"], time_str, duration)
             logger.info("Updated today's row for %s: checkout=%s, duration=%s",
                          name, time_str, duration)
             return
 
-        # Try yesterday's row (overnight shift)
-        yesterday_row = sheets.find_row(name, yesterday)
-        if yesterday_row and not yesterday_row["checkout"]:
-            duration = calculate_duration(yesterday_row["checkin"], time_str)
-            sheets.update_row(yesterday_row["row_number"], time_str, duration)
-            logger.info("Updated yesterday's row for %s (overnight): checkout=%s, duration=%s",
-                         name, time_str, duration)
-            return
+        # Try recent days for unclosed row (overnight / multi-day shift, up to 7 days)
+        for days_ago in range(1, 8):
+            past_date = (now - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+            past_row = sheets.find_row(name, past_date)
+            if past_row and not past_row["checkout"]:
+                duration = calculate_duration(past_row["checkin"], time_str)
+                sheets.update_row(name, past_row["row_number"], time_str, duration)
+                logger.info("Updated row for %s on %s: checkout=%s, duration=%s",
+                             name, past_date, time_str, duration)
+                return
 
         # No row found — create with N/A check-in
         sheets.append_row(name, today, "N/A", time_str, "N/A")

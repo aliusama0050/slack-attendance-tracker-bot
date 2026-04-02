@@ -80,10 +80,11 @@ class SlackUserResolver:
                 profile.get("first_name", ""),
                 profile.get("last_name", ""),
             ]
-            # Add first name from real_name
+            # Add all individual name parts from real_name
             real = profile.get("real_name", "") or user.get("real_name", "")
-            if real and " " in real:
-                variants.append(real.split()[0])
+            if real:
+                for part in real.split():
+                    variants.append(part)
 
             for v in variants:
                 v = v.strip()
