@@ -113,3 +113,11 @@ class GoogleSheetsClient:
         ws.update_cell(row_number, 4, duration)
         logger.info("Updated row %d in '%s': checkout=%s, duration=%s",
                      row_number, name, checkout, duration)
+
+    @_retry_on_rate_limit
+    def update_checkin(self, name: str, row_number: int, checkin: str) -> None:
+        """Update Check-In (col B) in the person's worksheet."""
+        ws = self._get_or_create_worksheet(name)
+        ws.update_cell(row_number, 2, checkin)
+        logger.info("Updated row %d in '%s': checkin=%s",
+                     row_number, name, checkin)

@@ -73,7 +73,17 @@ def process_attendance(
 
         existing = sheets.find_row(name, today)
         if existing:
-            logger.info("Duplicate check-in for %s on %s, ignoring", name, today)
+            if existing["checkin"] in ("N/A", ""):
+                # A checkout-only row exists — fill in the real check-in time
+                sheets.update_checkin(name, existing["row_number"], time_str)
+                if existing["checkout"]:
+                    duration = calculate_duration(time_str, existing["checkout"])
+                    sheets.update_row(name, existing["row_number"],
+                                      existing["checkout"], duration)
+                logger.info("Updated checkout-only row with check-in for %s: %s",
+                             name, time_str)
+            else:
+                logger.info("Duplicate check-in for %s on %s, ignoring", name, today)
             return
         sheets.append_row(name, today, time_str, "", "")
         logger.info("Created check-in row: %s | %s | %s", name, today, time_str)
