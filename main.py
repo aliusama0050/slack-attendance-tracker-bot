@@ -174,6 +174,13 @@ async def slack_events(request: Request, background_tasks: BackgroundTasks):
             background_tasks.add_task(
                 process_attendance, event, resolver, sheets_client
             )
+        elif event_type == "message" and subtype == "message_changed":
+            inner = event.get("message", {})
+            if inner.get("text"):
+                background_tasks.add_task(
+                    process_attendance, inner, resolver, sheets_client,
+                    is_edit=True,
+                )
 
     return {"ok": True}
 

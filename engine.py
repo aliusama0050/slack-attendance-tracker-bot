@@ -2,7 +2,8 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from duration import calculate_duration
+from duration import calculate_duration, normalize_time
+from llm_parser import llm_parse_message
 from msg_parser import parse_message
 from resolver import SlackUserResolver
 from sheets import GoogleSheetsClient
@@ -23,6 +24,7 @@ def process_attendance(
     event: dict,
     resolver: SlackUserResolver,
     sheets: GoogleSheetsClient,
+    is_edit: bool = False,
 ) -> None:
     """Core decision engine for processing attendance events.
 
@@ -31,8 +33,10 @@ def process_attendance(
     text = event.get("text", "")
     user_id = event.get("user")
 
-    # 1. Parse message
-    result = parse_message(text)
+    # 1. Parse message (LLM first, regex fallback)
+    result = llm_parse_message(text)
+    if result is None:
+        result = parse_message(text)
     if result.action == "skip":
         logger.debug("Skipping message: %s", text[:80])
         return
@@ -69,12 +73,22 @@ def process_attendance(
             if past_row and not past_row["checkout"]:
                 sheets.update_row(name, past_row["row_number"], "Missed", "Missed")
                 logger.warning("Auto-closed missed checkout for %s on %s", name, past_date)
-                break
 
         existing = sheets.find_row(name, today)
         if existing:
             if existing["checkin"] in ("N/A", ""):
-                # A checkout-only row exists — fill in the real check-in time
+                # A checkout-only row exists — check if it's from the same shift
+                if existing["checkout"]:
+                    checkout_t = normalize_time(existing["checkout"])
+                    checkin_t = normalize_time(time_str)
+                    if checkout_t and checkin_t and checkout_t < checkin_t:
+                        # Different shifts: checkout was end of overnight, check-in is new day
+                        sheets.append_row(name, today, time_str, "", "")
+                        logger.info("Checkout-only row at %s is from earlier shift; "
+                                     "created new check-in row for %s: %s",
+                                     existing["checkout"], name, time_str)
+                        return
+                # Same shift or no checkout yet — fill in the real check-in time
                 sheets.update_checkin(name, existing["row_number"], time_str)
                 if existing["checkout"]:
                     duration = calculate_duration(time_str, existing["checkout"])
@@ -83,7 +97,15 @@ def process_attendance(
                 logger.info("Updated checkout-only row with check-in for %s: %s",
                              name, time_str)
             else:
-                logger.info("Duplicate check-in for %s on %s, ignoring", name, today)
+                if is_edit:
+                    sheets.update_checkin(name, existing["row_number"], time_str)
+                    if existing["checkout"]:
+                        duration = calculate_duration(time_str, existing["checkout"])
+                        sheets.update_row(name, existing["row_number"],
+                                          existing["checkout"], duration)
+                    logger.info("Edit: updated check-in for %s to %s", name, time_str)
+                else:
+                    logger.info("Duplicate check-in for %s on %s, ignoring", name, today)
             return
         sheets.append_row(name, today, time_str, "", "")
         logger.info("Created check-in row: %s | %s | %s", name, today, time_str)
@@ -92,6 +114,9 @@ def process_attendance(
         # Try today's row first
         today_row = sheets.find_row(name, today)
         if today_row:
+            if today_row["checkout"] and not is_edit:
+                logger.info("Duplicate checkout for %s on %s, ignoring", name, today)
+                return
             duration = calculate_duration(today_row["checkin"], time_str)
             sheets.update_row(name, today_row["row_number"], time_str, duration)
             logger.info("Updated today's row for %s: checkout=%s, duration=%s",

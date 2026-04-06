@@ -6,6 +6,12 @@ from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+# Patch LLM parser to always return None (use regex fallback) for all engine tests
+import llm_parser
+llm_parser._parser = None
+_original_get = llm_parser.get_llm_parser
+llm_parser.get_llm_parser = lambda: None
+
 from engine import process_attendance
 
 KARACHI = ZoneInfo("Asia/Karachi")
@@ -280,3 +286,196 @@ class TestSkip:
         )
         sheets.append_row.assert_not_called()
         sheets.update_row.assert_not_called()
+
+
+class TestCheckoutGuard:
+    @patch("engine.datetime")
+    def test_duplicate_checkout_ignored(self, mock_dt):
+        """Second checkout on same row should be ignored (not overwritten)."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 23, 30, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+        sheets.find_row.return_value = {
+            "row_number": 5,
+            "date": "2026-04-02",
+            "checkin": "8:00 AM",
+            "checkout": "11:00 PM",
+            "duration": "15h 0m",
+        }
+
+        process_attendance(
+            _make_event("Checkout 11:30 PM"), resolver, sheets
+        )
+
+        sheets.update_row.assert_not_called()
+
+    @patch("engine.datetime")
+    def test_edit_checkout_overwrites(self, mock_dt):
+        """Checkout with is_edit=True should overwrite existing checkout."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 23, 30, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+        sheets.find_row.return_value = {
+            "row_number": 5,
+            "date": "2026-04-02",
+            "checkin": "8:00 AM",
+            "checkout": "11:00 PM",
+            "duration": "15h 0m",
+        }
+
+        process_attendance(
+            _make_event("Checkout 11:30 PM"), resolver, sheets, is_edit=True
+        )
+
+        sheets.update_row.assert_called_once_with("John Doe", 5, "11:30 PM", "15h 30m")
+
+
+class TestEditCheckin:
+    @patch("engine.datetime")
+    def test_edit_checkin_updates_time(self, mock_dt):
+        """Check-in edit should update existing check-in time."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 10, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-02":
+                return {
+                    "row_number": 5,
+                    "date": "2026-04-02",
+                    "checkin": "9:00 AM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Check in 9:30 am"), resolver, sheets, is_edit=True
+        )
+
+        sheets.update_checkin.assert_called_once_with("John Doe", 5, "9:30 am")
+
+
+class TestShiftMerge:
+    @patch("engine.datetime")
+    def test_different_shift_not_merged(self, mock_dt):
+        """Checkout-only row at 12:19 AM + check-in at 8:35 AM → new row (different shifts)."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 8, 35, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-02":
+                return {
+                    "row_number": 5,
+                    "date": "2026-04-02",
+                    "checkin": "N/A",
+                    "checkout": "12:19 AM",
+                    "duration": "N/A",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("check in : 8:35 am"), resolver, sheets
+        )
+
+        # Should NOT merge — should create a new row
+        sheets.update_checkin.assert_not_called()
+        sheets.append_row.assert_called_once_with(
+            "John Doe", "2026-04-02", "8:35 am", "", ""
+        )
+
+    @patch("engine.datetime")
+    def test_same_shift_merged(self, mock_dt):
+        """Checkout-only row at 11:00 PM + check-in at 7:00 PM → merge (same evening shift)."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 19, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-02":
+                return {
+                    "row_number": 5,
+                    "date": "2026-04-02",
+                    "checkin": "N/A",
+                    "checkout": "11:00 PM",
+                    "duration": "N/A",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Check in: 7:00 pm"), resolver, sheets
+        )
+
+        # Should merge — fill in check-in and recalculate duration
+        sheets.update_checkin.assert_called_once_with("John Doe", 5, "7:00 pm")
+        sheets.update_row.assert_called_once_with("John Doe", 5, "11:00 PM", "4h 0m")
+
+
+class TestAutoCloseMultiple:
+    @patch("engine.datetime")
+    def test_auto_close_multiple_unclosed_days(self, mock_dt):
+        """Check-in should auto-close ALL unclosed rows, not just the first."""
+        mock_dt.now.return_value = datetime(2026, 4, 4, 9, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+
+        def find_row_side_effect(name, date):
+            if date == "2026-04-03":
+                return {
+                    "row_number": 8,
+                    "date": "2026-04-03",
+                    "checkin": "9:00 AM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            if date == "2026-04-02":
+                return {
+                    "row_number": 6,
+                    "date": "2026-04-02",
+                    "checkin": "10:00 AM",
+                    "checkout": "",
+                    "duration": "",
+                }
+            return None
+
+        sheets.find_row.side_effect = find_row_side_effect
+
+        process_attendance(
+            _make_event("Check in 9:00 am"), resolver, sheets
+        )
+
+        # Both days should be auto-closed
+        assert sheets.update_row.call_count == 2
+        sheets.update_row.assert_any_call("John Doe", 8, "Missed", "Missed")
+        sheets.update_row.assert_any_call("John Doe", 6, "Missed", "Missed")
+        # And today's row created
+        sheets.append_row.assert_called_once_with(
+            "John Doe", "2026-04-04", "9:00 am", "", ""
+        )
+
+
+class TestLLMFallback:
+    @patch("engine.llm_parse_message", return_value=None)
+    @patch("engine.datetime")
+    def test_falls_back_to_regex_when_llm_returns_none(self, mock_dt, mock_llm):
+        """When LLM parser returns None, regex parser should handle the message."""
+        mock_dt.now.return_value = datetime(2026, 4, 2, 10, 0, tzinfo=KARACHI)
+        mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        resolver, sheets = _make_mocks()
+        sheets.find_row.return_value = None
+
+        process_attendance(
+            _make_event("Check in 10:47 am"), resolver, sheets
+        )
+
+        mock_llm.assert_called_once()
+        sheets.append_row.assert_called_once_with(
+            "John Doe", "2026-04-02", "10:47 am", "", ""
+        )
